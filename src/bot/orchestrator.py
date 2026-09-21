@@ -10,6 +10,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
@@ -49,6 +50,21 @@ _MEDIA_TYPE_MAP = {
     "gif": "image/gif",
     "webp": "image/webp",
 }
+
+
+def _format_relative_time(dt: datetime) -> str:
+    """Human-friendly 'time ago' label for a session timestamp."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    delta = datetime.now(timezone.utc) - dt
+    secs = int(delta.total_seconds())
+    if secs < 60:
+        return "just now"
+    if secs < 3600:
+        return f"{secs // 60}m ago"
+    if secs < 86400:
+        return f"{secs // 3600}h ago"
+    return f"{secs // 86400}d ago"
 
 # Patterns that look like secrets/credentials in CLI arguments
 _SECRET_PATTERNS: List[re.Pattern[str]] = [
@@ -335,6 +351,7 @@ class MessageOrchestrator:
             ("start", self.agentic_start),
             ("new", self.agentic_new),
             ("status", self.agentic_status),
+            ("sessions", self.agentic_sessions),
             ("verbose", self.agentic_verbose),
             ("repo", self.agentic_repo),
             ("restart", command.restart_command),
@@ -414,6 +431,14 @@ class MessageOrchestrator:
             )
         )
 
+        # sess: callbacks (resume a chosen session)
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(self._agentic_sessions_callback),
+                pattern=r"^sess:",
+            )
+        )
+
         logger.info("Agentic handlers registered")
 
     def _register_classic_handlers(self, app: Application) -> None:
@@ -476,6 +501,7 @@ class MessageOrchestrator:
                 BotCommand("start", "Start the bot"),
                 BotCommand("new", "Start a fresh session"),
                 BotCommand("status", "Show session status"),
+                BotCommand("sessions", "List & resume saved sessions"),
                 BotCommand("verbose", "Set output verbosity (0/1/2)"),
                 BotCommand("repo", "List repos / switch workspace"),
                 BotCommand("restart", "Restart the bot"),
@@ -597,6 +623,122 @@ class MessageOrchestrator:
         await update.message.reply_text(
             f"📂 {dir_display} · Session: {session_status}{cost_str}"
         )
+
+    async def agentic_sessions(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """List saved sessions in the current project, with buttons to resume."""
+        current_dir = context.user_data.get(
+            "current_directory", self.settings.approved_directory
+        )
+        current_dir = Path(current_dir)
+
+        claude_integration = context.bot_data.get("claude_integration")
+        if not claude_integration:
+            await update.message.reply_text("Session manager unavailable.")
+            return
+
+        try:
+            all_sessions = await claude_integration.get_user_sessions(
+                update.effective_user.id
+            )
+        except Exception as e:
+            logger.warning("Failed to list sessions", error=str(e))
+            await update.message.reply_text("Couldn't load sessions.")
+            return
+
+        # Keep sessions for the current project that have a real, non-expired id
+        sessions = [
+            s
+            for s in all_sessions
+            if Path(s["project_path"]) == current_dir
+            and s.get("session_id")
+            and not s.get("expired")
+        ]
+        sessions.sort(key=lambda s: s["last_used"], reverse=True)
+
+        if not sessions:
+            await update.message.reply_text(
+                f"No saved sessions in <code>{escape_html(current_dir.name)}/</code>.\n"
+                "Start chatting to create one.",
+                parse_mode="HTML",
+            )
+            return
+
+        active_id = context.user_data.get("claude_session_id")
+        lines: List[str] = [
+            f"<b>Sessions in {escape_html(current_dir.name)}/</b>\n"
+        ]
+        keyboard_rows: List[list] = []  # type: ignore[type-arg]
+
+        for idx, s in enumerate(sessions, start=1):
+            try:
+                last = _format_relative_time(datetime.fromisoformat(s["last_used"]))
+            except (ValueError, KeyError):
+                last = "?"
+            msgs = s.get("message_count", 0)
+            cost = s.get("total_cost", 0.0)
+            marker = " ◀" if s["session_id"] == active_id else ""
+            lines.append(
+                f"{idx}. {last} · {msgs} msgs · ${cost:.2f}{marker}"
+            )
+            keyboard_rows.append(
+                [
+                    InlineKeyboardButton(
+                        f"{idx}. {last} · {msgs} msgs",
+                        callback_data=f"sess:{s['session_id']}",
+                    )
+                ]
+            )
+
+        await update.message.reply_text(
+            "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard_rows),
+        )
+
+    async def _agentic_sessions_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle sess: callbacks — resume the chosen session."""
+        query = update.callback_query
+        await query.answer()
+
+        session_id = query.data.split(":", 1)[1]
+
+        # Verify the session belongs to this user before resuming
+        claude_integration = context.bot_data.get("claude_integration")
+        owned = False
+        if claude_integration:
+            try:
+                user_sessions = await claude_integration.get_user_sessions(
+                    query.from_user.id
+                )
+                owned = any(s.get("session_id") == session_id for s in user_sessions)
+            except Exception:
+                owned = False
+
+        if not owned:
+            await query.edit_message_text("That session is no longer available.")
+            return
+
+        context.user_data["claude_session_id"] = session_id
+        context.user_data["force_new_session"] = False
+
+        await query.edit_message_text(
+            f"✅ Resumed session <code>{escape_html(session_id[:8])}</code>. "
+            "Continue where you left off.",
+            parse_mode="HTML",
+        )
+
+        audit_logger = context.bot_data.get("audit_logger")
+        if audit_logger:
+            await audit_logger.log_command(
+                user_id=query.from_user.id,
+                command="sessions",
+                args=["resume"],
+                success=True,
+            )
 
     def _get_verbose_level(self, context: ContextTypes.DEFAULT_TYPE) -> int:
         """Return effective verbose level: per-user override or global default."""

@@ -708,6 +708,36 @@ class ClaudeSDKManager:
                             content_parts.append(str(msg_content))
                 content = "\n".join(content_parts).strip()
 
+            # Check if ExitPlanMode was used - add plan notification
+            plan_tool = next(
+                (t for t in tools_used if t.get("name") == "ExitPlanMode"),
+                None,
+            )
+            if plan_tool:
+                plan_input = plan_tool.get("input", {})
+                plan_content = plan_input.get("plan", "")
+                plan_file = plan_input.get("planFilePath", "")
+                
+                plan_notification = "\n\n📋 **Plan đã được viết xong!**"
+                if plan_file:
+                    plan_notification += f"\n📁 File: `{plan_file}`"
+                if plan_content:
+                    # Extract first few lines as summary
+                    plan_lines = plan_content.strip().split("\n")
+                    summary_lines = [
+                        line for line in plan_lines[:10]
+                        if line.strip() and not line.startswith("#")
+                    ]
+                    if summary_lines:
+                        plan_notification += "\n\n**Tóm tắt:**\n" + "\n".join(summary_lines[:5])
+                
+                plan_notification += "\n\n💬 Gửi \"thực hiện plan\" để bắt đầu thực thi."
+                
+                if content:
+                    content += plan_notification
+                else:
+                    content = plan_notification
+
             if not content and tools_used:
                 tool_names = [
                     tool.get("name", "")
