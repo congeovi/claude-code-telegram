@@ -393,6 +393,8 @@ async def handle_text_message(
                 session_id=session_id,
                 on_stream=stream_handler,
                 force_new=force_new,
+                model=context.user_data.get("claude_model"),
+                permission_mode=context.user_data.get("claude_mode"),
             )
 
             # New session created successfully — clear the one-shot flag
@@ -401,6 +403,9 @@ async def handle_text_message(
 
             # Update session ID
             context.user_data["claude_session_id"] = claude_response.session_id
+
+            # Accumulate usage stats
+            _accumulate_session_usage(context, claude_response)
 
             # Check if Claude changed the working directory and update our tracking
             _update_working_directory_from_claude_response(
@@ -818,10 +823,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 working_directory=current_dir,
                 user_id=user_id,
                 session_id=session_id,
+                model=context.user_data.get("claude_model"),
+                permission_mode=context.user_data.get("claude_mode"),
             )
 
             # Update session ID
             context.user_data["claude_session_id"] = claude_response.session_id
+            _accumulate_session_usage(context, claude_response)
 
             # Check if Claude changed the working directory and update our tracking
             _update_working_directory_from_claude_response(
@@ -945,10 +953,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     working_directory=current_dir,
                     user_id=user_id,
                     session_id=session_id,
+                    model=context.user_data.get("claude_model"),
+                    permission_mode=context.user_data.get("claude_mode"),
                 )
 
                 # Update session ID
                 context.user_data["claude_session_id"] = claude_response.session_id
+                _accumulate_session_usage(context, claude_response)
 
                 # Format and send response
                 from ..utils.formatting import ResponseFormatter
@@ -1073,9 +1084,12 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 working_directory=current_dir,
                 user_id=user_id,
                 session_id=session_id,
+                model=context.user_data.get("claude_model"),
+                permission_mode=context.user_data.get("claude_mode"),
             )
 
             context.user_data["claude_session_id"] = claude_response.session_id
+            _accumulate_session_usage(context, claude_response)
 
             _update_working_directory_from_claude_response(
                 claude_response, context, settings, user_id
@@ -1286,3 +1300,31 @@ def _update_working_directory_from_claude_response(
                     "Invalid path in Claude response", path=match, error=str(e)
                 )
                 continue
+
+
+def _accumulate_session_usage(context, claude_response) -> None:
+    """Accumulate token and cost usage stats from Claude response into session."""
+    stats = context.user_data.setdefault(
+        "session_usage",
+        {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_tokens": 0,
+            "cache_read_tokens": 0,
+            "total_cost": 0.0,
+            "turns": 0,
+        },
+    )
+    usage = getattr(claude_response, "usage", None)
+    if isinstance(usage, dict):
+        stats["input_tokens"] += usage.get("input_tokens", 0) or 0
+        stats["output_tokens"] += usage.get("output_tokens", 0) or 0
+        stats["cache_creation_tokens"] += (
+            usage.get("cache_creation_input_tokens", 0) or 0
+        )
+        stats["cache_read_tokens"] += (
+            usage.get("cache_read_input_tokens", 0) or 0
+        )
+    stats["total_cost"] += getattr(claude_response, "cost", 0.0) or 0.0
+    stats["turns"] += getattr(claude_response, "num_turns", 1) or 1
+

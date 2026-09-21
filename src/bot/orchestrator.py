@@ -31,9 +31,19 @@ from telegram.ext import (
     filters,
 )
 
+from ..claude.models import fetch_claude_models, get_cached_models, resolve_model_id
 from ..claude.sdk_integration import StreamUpdate
 from ..config.settings import Settings
 from ..projects import PrivateTopicsUnavailableError
+from .keyboards import (
+    SUPPORTED_MODELS,
+    SUPPORTED_MODES,
+    menu_keyboard,
+    mode_keyboard,
+    model_keyboard,
+    tokens_keyboard,
+    workspace_keyboard,
+)
 from .utils.draft_streamer import DraftStreamer, generate_draft_id
 from .utils.html_format import escape_html
 from .utils.image_extractor import (
@@ -355,6 +365,17 @@ class MessageOrchestrator:
             ("verbose", self.agentic_verbose),
             ("repo", self.agentic_repo),
             ("restart", command.restart_command),
+            ("model", self.agentic_model),
+            ("models", self.agentic_model),
+            ("mode", self.agentic_mode),
+            ("stop", self.agentic_stop),
+            ("cancel", self.agentic_stop),
+            ("compact", self.agentic_compact),
+            ("tokens", self.agentic_tokens),
+            ("cost", self.agentic_tokens),
+            ("workspace", self.agentic_workspace),
+            ("menu", self.agentic_menu),
+            ("help", self.agentic_help),
         ]
         if self.settings.enable_project_threads:
             handlers.append(("sync_threads", command.sync_threads))
@@ -439,6 +460,38 @@ class MessageOrchestrator:
             )
         )
 
+        # set: callbacks (model, mode, ws)
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(self._handle_set_callback),
+                pattern=r"^set:",
+            )
+        )
+
+        # menu: callbacks (navigation)
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(self._handle_menu_callback),
+                pattern=r"^menu:",
+            )
+        )
+
+        # action: callbacks
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(self._handle_action_callback),
+                pattern=r"^action:",
+            )
+        )
+
+        # noop callback
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(self._handle_noop_callback),
+                pattern=r"^noop$",
+            )
+        )
+
         logger.info("Agentic handlers registered")
 
     def _register_classic_handlers(self, app: Application) -> None:
@@ -460,6 +513,16 @@ class MessageOrchestrator:
             ("actions", command.quick_actions),
             ("git", command.git_command),
             ("restart", command.restart_command),
+            ("model", self.agentic_model),
+            ("models", self.agentic_model),
+            ("mode", self.agentic_mode),
+            ("stop", self.agentic_stop),
+            ("cancel", self.agentic_stop),
+            ("compact", self.agentic_compact),
+            ("tokens", self.agentic_tokens),
+            ("cost", self.agentic_tokens),
+            ("workspace", self.agentic_workspace),
+            ("menu", self.agentic_menu),
         ]
         if self.settings.enable_project_threads:
             handlers.append(("sync_threads", command.sync_threads))
@@ -489,22 +552,52 @@ class MessageOrchestrator:
             group=10,
         )
         app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(self._handle_set_callback),
+                pattern=r"^set:",
+            )
+        )
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(self._handle_menu_callback),
+                pattern=r"^menu:",
+            )
+        )
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(self._handle_action_callback),
+                pattern=r"^action:",
+            )
+        )
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(self._handle_noop_callback),
+                pattern=r"^noop$",
+            )
+        )
+        app.add_handler(
             CallbackQueryHandler(self._inject_deps(callback.handle_callback_query))
         )
 
-        logger.info("Classic handlers registered (13 commands + full handler set)")
+        logger.info("Classic handlers registered (with Antigravity CLI extensions)")
 
     async def get_bot_commands(self) -> list:  # type: ignore[type-arg]
         """Return bot commands appropriate for current mode."""
         if self.settings.agentic_mode:
             commands = [
-                BotCommand("start", "Start the bot"),
-                BotCommand("new", "Start a fresh session"),
-                BotCommand("status", "Show session status"),
-                BotCommand("sessions", "List & resume saved sessions"),
-                BotCommand("verbose", "Set output verbosity (0/1/2)"),
-                BotCommand("repo", "List repos / switch workspace"),
-                BotCommand("restart", "Restart the bot"),
+                BotCommand("start", "Khởi động bot"),
+                BotCommand("menu", "Bàn phím điều hướng tổng thể"),
+                BotCommand("model", "Chọn model Claude (3.7 Sonnet, Haiku, Opus)"),
+                BotCommand("mode", "Chế độ plan hoặc accept-edits"),
+                BotCommand("workspace", "Xem và chuyển đổi workspace"),
+                BotCommand("tokens", "Báo cáo token & chi phí session"),
+                BotCommand("compact", "Nén ngữ cảnh session"),
+                BotCommand("stop", "Ngắt tác vụ đang xử lý"),
+                BotCommand("cancel", "Hủy tác vụ đang xử lý"),
+                BotCommand("new", "Bắt đầu phiên làm việc mới"),
+                BotCommand("sessions", "Danh sách & tiếp tục session"),
+                BotCommand("status", "Xem trạng thái hệ thống"),
+                BotCommand("help", "Xem hướng dẫn lệnh"),
             ]
             if self.settings.enable_project_threads:
                 commands.append(BotCommand("sync_threads", "Sync project topics"))
@@ -593,8 +686,9 @@ class MessageOrchestrator:
         context.user_data["claude_session_id"] = None
         context.user_data["session_started"] = True
         context.user_data["force_new_session"] = True
+        context.user_data.pop("session_usage", None)
 
-        await update.message.reply_text("Session reset. What's next?")
+        await update.message.reply_text("🆕 <b>Đã khởi tạo phiên làm việc mới.</b>\nBạn muốn làm gì tiếp theo?", parse_mode="HTML")
 
     async def agentic_status(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -1225,6 +1319,8 @@ class MessageOrchestrator:
                 force_new=force_new,
                 interrupt_event=interrupt_event,
                 approval_callback=approval_cb,
+                model=context.user_data.get("claude_model"),
+                permission_mode=context.user_data.get("claude_mode"),
             )
 
             # New session created successfully — clear the one-shot flag
@@ -1232,6 +1328,7 @@ class MessageOrchestrator:
                 context.user_data["force_new_session"] = False
 
             context.user_data["claude_session_id"] = claude_response.session_id
+            self._accumulate_usage(context, claude_response)
 
             # Track directory changes
             from .handlers.message import _update_working_directory_from_claude_response
@@ -1399,9 +1496,24 @@ class MessageOrchestrator:
             )
             return
 
+        if user_id in self._active_requests:
+            await update.message.reply_text(
+                "⚠️ <b>Đang có một tác vụ đang xử lý.</b>\n\n"
+                "Vui lòng chờ hoặc gửi /stop để ngắt tác vụ hiện tại.",
+                parse_mode="HTML",
+            )
+            return
+
         chat = update.message.chat
         await chat.send_action("typing")
         progress_msg = await update.message.reply_text("Working...")
+
+        interrupt_event = asyncio.Event()
+        self._active_requests[user_id] = ActiveRequest(
+            user_id=user_id,
+            interrupt_event=interrupt_event,
+            progress_msg=progress_msg,
+        )
 
         # Try enhanced file handler, fall back to basic
         features = context.bot_data.get("features")
@@ -1475,12 +1587,16 @@ class MessageOrchestrator:
                 session_id=session_id,
                 on_stream=on_stream,
                 force_new=force_new,
+                interrupt_event=interrupt_event,
+                model=context.user_data.get("claude_model"),
+                permission_mode=context.user_data.get("claude_mode"),
             )
 
             if force_new:
                 context.user_data["force_new_session"] = False
 
             context.user_data["claude_session_id"] = claude_response.session_id
+            self._accumulate_usage(context, claude_response)
 
             from .handlers.message import _update_working_directory_from_claude_response
 
@@ -1548,6 +1664,7 @@ class MessageOrchestrator:
             logger.error("Claude file processing failed", error=str(e), user_id=user_id)
         finally:
             heartbeat.cancel()
+            self._active_requests.pop(user_id, None)
 
     async def agentic_photo(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -1675,6 +1792,13 @@ class MessageOrchestrator:
             approved_directory=self.settings.approved_directory,
         )
 
+        interrupt_event = asyncio.Event()
+        self._active_requests[user_id] = ActiveRequest(
+            user_id=user_id,
+            interrupt_event=interrupt_event,
+            progress_msg=progress_msg,
+        )
+
         heartbeat = self._start_typing_heartbeat(chat)
         try:
             claude_response = await claude_integration.run_command(
@@ -1684,15 +1808,20 @@ class MessageOrchestrator:
                 session_id=session_id,
                 on_stream=on_stream,
                 force_new=force_new,
+                interrupt_event=interrupt_event,
                 images=images,
+                model=context.user_data.get("claude_model"),
+                permission_mode=context.user_data.get("claude_mode"),
             )
         finally:
             heartbeat.cancel()
+            self._active_requests.pop(user_id, None)
 
         if force_new:
             context.user_data["force_new_session"] = False
 
         context.user_data["claude_session_id"] = claude_response.session_id
+        self._accumulate_usage(context, claude_response)
 
         from .handlers.message import _update_working_directory_from_claude_response
 
@@ -2078,3 +2207,667 @@ class MessageOrchestrator:
                 args=[project_name],
                 success=True,
             )
+
+    def _accumulate_usage(
+        self, context: ContextTypes.DEFAULT_TYPE, claude_response: Any
+    ) -> None:
+        """Accumulate token usage and cost in context.user_data."""
+        stats = context.user_data.setdefault(
+            "session_usage",
+            {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "total_cost": 0.0,
+                "turns": 0,
+            },
+        )
+        usage = getattr(claude_response, "usage", None)
+        if isinstance(usage, dict):
+            stats["input_tokens"] += usage.get("input_tokens", 0) or 0
+            stats["output_tokens"] += usage.get("output_tokens", 0) or 0
+            stats["cache_creation_tokens"] += (
+                usage.get("cache_creation_input_tokens", 0) or 0
+            )
+            stats["cache_read_tokens"] += (
+                usage.get("cache_read_input_tokens", 0) or 0
+            )
+        stats["total_cost"] += getattr(claude_response, "cost", 0.0) or 0.0
+        stats["turns"] += getattr(claude_response, "num_turns", 1) or 1
+
+    async def agentic_model(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle /model command - view or select Claude model."""
+        msg = update.effective_message
+        if not msg:
+            return
+        args = msg.text.split()[1:] if msg.text else []
+        models = await fetch_claude_models()
+        if args:
+            target = args[0].strip()
+            if target.lower() in ("default", "clear", "reset"):
+                context.user_data["claude_model"] = None
+                await msg.reply_text(
+                    "🔄 <b>Đã đặt lại model về mặc định hệ thống.</b>",
+                    parse_mode="HTML",
+                    reply_markup=model_keyboard(None, models=models),
+                )
+                return
+
+            chosen_model = resolve_model_id(target, models=models)
+            context.user_data["claude_model"] = chosen_model
+            await msg.reply_text(
+                f"🤖 <b>Đã chuyển sang model:</b> <code>{escape_html(chosen_model or '')}</code>",
+                parse_mode="HTML",
+                reply_markup=model_keyboard(chosen_model, models=models),
+            )
+            return
+
+        current_model = context.user_data.get("claude_model")
+        display_name = current_model or "Mặc định hệ thống"
+        await msg.reply_text(
+            f"🤖 <b>Chọn Model Claude:</b>\n\nModel hiện tại: <code>{escape_html(display_name)}</code>",
+            parse_mode="HTML",
+            reply_markup=model_keyboard(current_model, models=models),
+        )
+
+    async def agentic_mode(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle /mode command - switch between plan, accept-edits, default."""
+        msg = update.effective_message
+        if not msg:
+            return
+        args = msg.text.split()[1:] if msg.text else []
+        if args:
+            target = args[0].strip().lower().replace("-", "").replace("_", "")
+            if target in ("plan",):
+                context.user_data["claude_mode"] = "plan"
+                await msg.reply_text(
+                    "📋 <b>Đã chuyển sang chế độ: Plan (Chỉ lập kế hoạch, không sửa code)</b>",
+                    parse_mode="HTML",
+                    reply_markup=mode_keyboard("plan"),
+                )
+                return
+            elif target in ("acceptedits", "edit", "edits"):
+                context.user_data["claude_mode"] = "acceptEdits"
+                await msg.reply_text(
+                    "⚡ <b>Đã chuyển sang chế độ: Accept Edits (Tự động thực thi & chỉnh sửa)</b>",
+                    parse_mode="HTML",
+                    reply_markup=mode_keyboard("acceptEdits"),
+                )
+                return
+            elif target in ("default", "clear", "reset"):
+                context.user_data["claude_mode"] = "default"
+                await msg.reply_text(
+                    "🛡️ <b>Đã chuyển sang chế độ: Mặc định (Hỏi xác nhận khi cần)</b>",
+                    parse_mode="HTML",
+                    reply_markup=mode_keyboard("default"),
+                )
+                return
+            else:
+                await msg.reply_text(
+                    f"⚠️ Chế độ không hợp lệ: <code>{escape_html(args[0])}</code>\n"
+                    "Lựa chọn: <code>plan</code>, <code>accept-edits</code>, <code>default</code>",
+                    parse_mode="HTML",
+                    reply_markup=mode_keyboard(context.user_data.get("claude_mode")),
+                )
+                return
+
+        current_mode = context.user_data.get("claude_mode", "default")
+        await msg.reply_text(
+            "⚙️ <b>Chế độ thực thi (Execution Mode):</b>\n\n"
+            "• 📋 <b>Plan</b>: Lập kế hoạch chi tiết, không chỉnh sửa file.\n"
+            "• ⚡ <b>Accept Edits</b>: Tự động chạy lệnh và áp dụng sửa đổi mã nguồn.\n"
+            "• 🛡️ <b>Default</b>: Chế độ an toàn chuẩn (hỏi xác nhận khi cần).\n\n"
+            f"Chế độ hiện tại: <code>{escape_html(current_mode)}</code>",
+            parse_mode="HTML",
+            reply_markup=mode_keyboard(current_mode),
+        )
+
+    async def agentic_stop(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle /stop or /cancel command - interrupt running request."""
+        user = update.effective_user
+        msg = update.effective_message
+        if not user or not msg:
+            return
+        active = self._active_requests.get(user.id)
+        if not active:
+            await msg.reply_text(
+                "ℹ️ <b>Hiện không có tác vụ nào đang xử lý.</b>",
+                parse_mode="HTML",
+            )
+            return
+
+        if active.interrupted:
+            await msg.reply_text(
+                "⏳ <b>Tác vụ đang trong quá trình dừng...</b>",
+                parse_mode="HTML",
+            )
+            return
+
+        active.interrupt_event.set()
+        active.interrupted = True
+        try:
+            if active.progress_msg:
+                await active.progress_msg.edit_text(
+                    "🛑 Đang dừng tác vụ...", reply_markup=None
+                )
+        except Exception:
+            pass
+
+        await msg.reply_text(
+            "🛑 <b>Đã gửi lệnh ngắt tác vụ đang xử lý.</b>",
+            parse_mode="HTML",
+        )
+
+    async def agentic_compact(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle /compact command - trigger context compaction."""
+        user = update.effective_user
+        msg = update.effective_message
+        if not user or not msg:
+            return
+
+        claude_integration = context.bot_data.get("claude_integration")
+        if not claude_integration:
+            await msg.reply_text("Claude integration not available.")
+            return
+
+        session_id = context.user_data.get("claude_session_id")
+        if not session_id:
+            await msg.reply_text(
+                "ℹ️ Chưa có phiên làm việc nào đang mở để nén ngữ cảnh.\n"
+                "Hãy gửi tin nhắn bất kỳ để bắt đầu một phiên mới.",
+                parse_mode="HTML",
+            )
+            return
+
+        if self._active_requests.get(user.id):
+            await msg.reply_text(
+                "⚠️ Đang có tác vụ khác đang chạy. Vui lòng chờ hoặc gửi /stop trước.",
+                parse_mode="HTML",
+            )
+            return
+
+        if update.callback_query:
+            compact_prompt = "/compact"
+        else:
+            args = (
+                msg.text.split(maxsplit=1)[1]
+                if msg and msg.text and len(msg.text.split()) > 1
+                else ""
+            )
+            compact_prompt = f"/compact {args}".strip()
+
+        current_dir = context.user_data.get(
+            "current_directory", self.settings.approved_directory
+        )
+        progress_msg = await msg.reply_text(
+            "🗜️ <i>Đang thực hiện nén ngữ cảnh phiên làm việc...</i>",
+            parse_mode="HTML",
+        )
+
+        interrupt_event = asyncio.Event()
+        self._active_requests[user.id] = ActiveRequest(
+            user_id=user.id,
+            interrupt_event=interrupt_event,
+            progress_msg=progress_msg,
+        )
+
+        try:
+            claude_response = await claude_integration.run_command(
+                prompt=compact_prompt,
+                working_directory=current_dir,
+                user_id=user.id,
+                session_id=session_id,
+                interrupt_event=interrupt_event,
+                model=context.user_data.get("claude_model"),
+                permission_mode=context.user_data.get("claude_mode"),
+            )
+            self._accumulate_usage(context, claude_response)
+            result_preview = (
+                escape_html(claude_response.content[:800])
+                if claude_response.content
+                else "Đã hoàn thành nén ngữ cảnh."
+            )
+            await progress_msg.edit_text(
+                f"🗜️ <b>Ngữ cảnh đã được nén thành công!</b>\n\n{result_preview}",
+                parse_mode="HTML",
+                reply_markup=tokens_keyboard(),
+            )
+        except Exception as e:
+            await progress_msg.edit_text(
+                f"❌ <b>Nén ngữ cảnh thất bại:</b>\n<code>{escape_html(str(e))}</code>",
+                parse_mode="HTML",
+            )
+        finally:
+            self._active_requests.pop(user.id, None)
+
+    async def agentic_tokens(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle /tokens or /cost command - report token usage and cost."""
+        msg = update.effective_message
+        if not msg:
+            return
+
+        stats = context.user_data.get(
+            "session_usage",
+            {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_creation_tokens": 0,
+                "cache_read_tokens": 0,
+                "total_cost": 0.0,
+                "turns": 0,
+            },
+        )
+        session_id = context.user_data.get("claude_session_id")
+        session_display = (
+            f"<code>{escape_html(session_id[:16])}...</code>"
+            if session_id
+            else "<i>Chưa tạo phiên</i>"
+        )
+        current_model = (
+            context.user_data.get("claude_model")
+            or self.settings.claude_model
+            or "Mặc định (CLI)"
+        )
+        current_mode = context.user_data.get("claude_mode") or "default"
+
+        total_tokens = (
+            stats.get("input_tokens", 0)
+            + stats.get("output_tokens", 0)
+            + stats.get("cache_read_tokens", 0)
+            + stats.get("cache_creation_tokens", 0)
+        )
+
+        text = (
+            "📊 <b>Báo Cáo Token & Chi Phí Phiên Làm Việc</b>\n\n"
+            f"🆔 <b>Session:</b> {session_display}\n"
+            f"🤖 <b>Model:</b> <code>{escape_html(current_model)}</code>\n"
+            f"⚙️ <b>Chế độ:</b> <code>{escape_html(current_mode)}</code>\n"
+            f"🔄 <b>Lượt tương tác (Turns):</b> <code>{stats.get('turns', 0)}</code>\n\n"
+            "🔢 <b>Thống kê Token:</b>\n"
+            f"• <b>Prompt (Input):</b> <code>{stats.get('input_tokens', 0):,}</code>\n"
+            f"• <b>Completion (Output):</b> <code>{stats.get('output_tokens', 0):,}</code>\n"
+            f"• <b>Cache Đọc:</b> <code>{stats.get('cache_read_tokens', 0):,}</code>\n"
+            f"• <b>Cache Tạo:</b> <code>{stats.get('cache_creation_tokens', 0):,}</code>\n"
+            f"• <b>Tổng Tokens:</b> <b>{total_tokens:,}</b>\n\n"
+            f"💰 <b>Chi phí ước tính:</b> <b>${stats.get('total_cost', 0.0):.4f} USD</b>"
+        )
+        await msg.reply_text(
+            text, parse_mode="HTML", reply_markup=tokens_keyboard()
+        )
+
+    async def agentic_workspace(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle /workspace command - view and switch active workspace."""
+        msg = update.effective_message
+        if not msg:
+            return
+        args = msg.text.split()[1:] if msg.text else []
+        base = self.settings.approved_directory
+        current_dir = context.user_data.get("current_directory", base)
+
+        if args:
+            sub = args[0].strip()
+            if sub.lower() in ("clear", "reset", "default"):
+                context.user_data["current_directory"] = base
+                context.user_data["claude_session_id"] = None
+                context.user_data["force_new_session"] = True
+                context.user_data.pop("session_usage", None)
+                await msg.reply_text(
+                    f"🔄 <b>Đã đặt lại thư mục làm việc về mặc định:</b>\n<code>{escape_html(str(base))}</code>\n\nĐã bắt đầu một phiên mới.",
+                    parse_mode="HTML",
+                    reply_markup=workspace_keyboard(base, base, 0),
+                )
+                return
+
+            target_path = Path(sub)
+            if not target_path.is_absolute():
+                target_path = base / sub
+
+            if not target_path.is_dir():
+                await msg.reply_text(
+                    f"❌ <b>Thư mục không tồn tại:</b> <code>{escape_html(sub)}</code>",
+                    parse_mode="HTML",
+                )
+                return
+
+            try:
+                target_path.resolve().relative_to(base.resolve())
+            except ValueError:
+                await msg.reply_text(
+                    "🚫 <b>Thư mục nằm ngoài phạm vi cho phép!</b>",
+                    parse_mode="HTML",
+                )
+                return
+
+            context.user_data["current_directory"] = target_path
+            # Check for resumable session
+            claude_integration = context.bot_data.get("claude_integration")
+            session_id = None
+            if claude_integration:
+                existing = await claude_integration._find_resumable_session(
+                    update.effective_user.id, target_path
+                )
+                if existing:
+                    session_id = existing.session_id
+            context.user_data["claude_session_id"] = session_id
+
+            session_badge = (
+                " · Đã khôi phục session cũ" if session_id else " · Phiên mới"
+            )
+            await msg.reply_text(
+                f"📁 <b>Đã chuyển thư mục làm việc sang:</b>\n<code>{escape_html(str(target_path))}</code>{session_badge}",
+                parse_mode="HTML",
+                reply_markup=workspace_keyboard(target_path, base, 0),
+            )
+            return
+
+        is_custom = current_dir.resolve() != base.resolve()
+        text = (
+            "📁 <b>Quản Lý Thư Mục Làm Việc (Workspace)</b>\n\n"
+            f"📍 <b>Thư mục đang hoạt động:</b> <code>{escape_html(str(current_dir))}</code> {'(tùy chỉnh)' if is_custom else '(mặc định)'}\n"
+            f"⚙️ <b>Thư mục gốc:</b> <code>{escape_html(str(base))}</code>\n\n"
+            "<b>Cách dùng:</b>\n"
+            "• Bấm nút bên dưới để chuyển thư mục nhanh.\n"
+            "• Gõ <code>/workspace &lt;tên_thư_mục&gt;</code> để đổi thư mục.\n"
+            "• Gõ <code>/workspace reset</code> để về thư mục gốc."
+        )
+        await msg.reply_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=workspace_keyboard(current_dir, base, 0),
+        )
+
+    async def agentic_menu(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle /menu command - display master navigation keyboard."""
+        msg = update.effective_message
+        if not msg:
+            return
+        text = (
+            "⚙️ <b>Bàn Phím Điều Hướng Antigravity CLI</b>\n\n"
+            "Chọn chức năng bên dưới để quản lý bot và session của bạn:"
+        )
+        await msg.reply_text(text, parse_mode="HTML", reply_markup=menu_keyboard())
+
+    async def agentic_help(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle /help command - show command overview & navigation keyboard."""
+        msg = update.effective_message
+        if not msg:
+            return
+        help_text = (
+            "🤖 <b>Hướng Dẫn Lệnh Antigravity CLI cho Claude Code:</b>\n\n"
+            "▫️ <code>/model</code> - Chọn model AI (3.7 Sonnet, Haiku, Opus)\n"
+            "▫️ <code>/mode</code> - Đổi chế độ: <code>plan</code> (kế hoạch) / <code>accept-edits</code> (thực thi)\n"
+            "▫️ <code>/workspace</code> - Xem & đổi thư mục làm việc trực tiếp\n"
+            "▫️ <code>/tokens</code> | <code>/cost</code> - Báo cáo token và chi phí session\n"
+            "▫️ <code>/compact</code> - Nén ngữ cảnh hội thoại\n"
+            "▫️ <code>/stop</code> | <code>/cancel</code> - Ngắt ngay tác vụ đang chạy\n"
+            "▫️ <code>/new</code> - Khởi tạo phiên làm việc sạch mới\n"
+            "▫️ <code>/sessions</code> - Xem & tiếp tục các phiên cũ\n"
+            "▫️ <code>/status</code> - Trạng thái hệ thống\n"
+            "▫️ <code>/menu</code> - Mở menu điều hướng trực quan\n\n"
+            "💡 <i>Bạn cũng có thể gửi văn bản hoặc ảnh để Claude tự động xử lý.</i>"
+        )
+        await msg.reply_text(help_text, parse_mode="HTML", reply_markup=menu_keyboard())
+
+    async def _handle_set_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle set: callbacks (set:model:, set:mode:, set:ws:)."""
+        query = update.callback_query
+        if not query or not query.data:
+            return
+        parts = query.data.split(":")
+        category = parts[1] if len(parts) > 1 else ""
+        val = parts[2] if len(parts) > 2 else ""
+
+        if category == "model":
+            if val == "refresh":
+                models = await fetch_claude_models(force_refresh=True)
+                cur_model = context.user_data.get("claude_model")
+                display_name = cur_model or "Mặc định hệ thống"
+                await query.answer(f"Đã làm mới ({len(models)} models)")
+                try:
+                    await query.edit_message_text(
+                        f"🤖 <b>Chọn Model Claude:</b>\n\nModel hiện tại: <code>{escape_html(display_name)}</code>",
+                        parse_mode="HTML",
+                        reply_markup=model_keyboard(cur_model, models=models, page=0),
+                    )
+                except Exception:
+                    pass
+                return
+
+            if val == "default":
+                context.user_data["claude_model"] = None
+                await query.answer("Đã chọn model mặc định.")
+            else:
+                context.user_data["claude_model"] = val
+                await query.answer(f"Đã chọn: {val}")
+            cur_model = context.user_data.get("claude_model")
+            display_name = cur_model or "Mặc định hệ thống"
+            try:
+                models = get_cached_models()
+                await query.edit_message_text(
+                    f"🤖 <b>Chọn Model Claude:</b>\n\nModel hiện tại: <code>{escape_html(display_name)}</code>",
+                    parse_mode="HTML",
+                    reply_markup=model_keyboard(cur_model, models=models),
+                )
+            except Exception:
+                pass
+
+        elif category == "mode":
+            context.user_data["claude_mode"] = val
+            await query.answer(f"Đã chọn chế độ: {val}")
+            try:
+                await query.edit_message_text(
+                    "⚙️ <b>Chế độ thực thi (Execution Mode):</b>\n\n"
+                    "• 📋 <b>Plan</b>: Lập kế hoạch chi tiết, không chỉnh sửa file.\n"
+                    "• ⚡ <b>Accept Edits</b>: Tự động chạy lệnh và áp dụng sửa đổi mã nguồn.\n"
+                    "• 🛡️ <b>Default</b>: Chế độ an toàn chuẩn (hỏi xác nhận khi cần).\n\n"
+                    f"Chế độ hiện tại: <code>{escape_html(val)}</code>",
+                    parse_mode="HTML",
+                    reply_markup=mode_keyboard(val),
+                )
+            except Exception:
+                pass
+
+        elif category == "ws":
+            base = self.settings.approved_directory
+            if val == "clear":
+                context.user_data["current_directory"] = base
+                context.user_data["claude_session_id"] = None
+                context.user_data["force_new_session"] = True
+                context.user_data.pop("session_usage", None)
+                await query.answer("Đã về thư mục gốc.")
+                cur_dir = base
+            else:
+                target_path = base / val
+                if target_path.is_dir():
+                    context.user_data["current_directory"] = target_path
+                    claude_integration = context.bot_data.get("claude_integration")
+                    session_id = None
+                    if claude_integration:
+                        existing = await claude_integration._find_resumable_session(
+                            query.from_user.id, target_path
+                        )
+                        if existing:
+                            session_id = existing.session_id
+                    context.user_data["claude_session_id"] = session_id
+                    await query.answer(f"Đã chuyển sang: {val}")
+                    cur_dir = target_path
+                else:
+                    await query.answer("Thư mục không tồn tại!", show_alert=True)
+                    cur_dir = context.user_data.get("current_directory", base)
+
+            is_custom = cur_dir.resolve() != base.resolve()
+            text = (
+                "📁 <b>Quản Lý Thư Mục Làm Việc (Workspace)</b>\n\n"
+                f"📍 <b>Thư mục đang hoạt động:</b> <code>{escape_html(str(cur_dir))}</code> {'(tùy chỉnh)' if is_custom else '(mặc định)'}\n"
+                f"⚙️ <b>Thư mục gốc:</b> <code>{escape_html(str(base))}</code>\n\n"
+                "<b>Cách dùng:</b>\n"
+                "• Bấm nút bên dưới để chuyển thư mục nhanh.\n"
+                "• Gõ <code>/workspace &lt;tên_thư_mục&gt;</code> để đổi thư mục.\n"
+                "• Gõ <code>/workspace reset</code> để về thư mục gốc."
+            )
+            try:
+                await query.edit_message_text(
+                    text,
+                    parse_mode="HTML",
+                    reply_markup=workspace_keyboard(cur_dir, base, 0),
+                )
+            except Exception:
+                pass
+
+    async def _handle_menu_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle menu: navigation callbacks."""
+        query = update.callback_query
+        if not query or not query.data:
+            return
+        await query.answer()
+        action = query.data.split(":", 1)[1] if ":" in query.data else ""
+
+        if action == "main":
+            try:
+                await query.edit_message_text(
+                    "⚙️ <b>Bàn Phím Điều Hướng Antigravity CLI</b>\n\n"
+                    "Chọn chức năng bên dưới để quản lý bot và session của bạn:",
+                    parse_mode="HTML",
+                    reply_markup=menu_keyboard(),
+                )
+            except Exception:
+                pass
+        elif action == "model":
+            cur_model = context.user_data.get("claude_model")
+            display_name = cur_model or "Mặc định hệ thống"
+            models = await fetch_claude_models()
+            try:
+                await query.edit_message_text(
+                    f"🤖 <b>Chọn Model Claude:</b>\n\nModel hiện tại: <code>{escape_html(display_name)}</code>",
+                    parse_mode="HTML",
+                    reply_markup=model_keyboard(cur_model, models=models, page=0),
+                )
+            except Exception:
+                pass
+        elif action.startswith("model:page:"):
+            try:
+                page = int(action.split(":")[2])
+            except ValueError:
+                page = 0
+            cur_model = context.user_data.get("claude_model")
+            models = get_cached_models()
+            try:
+                await query.edit_message_reply_markup(
+                    reply_markup=model_keyboard(cur_model, models=models, page=page)
+                )
+            except Exception:
+                pass
+        elif action == "mode":
+            cur_mode = context.user_data.get("claude_mode", "default")
+            try:
+                await query.edit_message_text(
+                    "⚙️ <b>Chế độ thực thi (Execution Mode):</b>\n\n"
+                    "• 📋 <b>Plan</b>: Lập kế hoạch chi tiết, không chỉnh sửa file.\n"
+                    "• ⚡ <b>Accept Edits</b>: Tự động chạy lệnh và áp dụng sửa đổi mã nguồn.\n"
+                    "• 🛡️ <b>Default</b>: Chế độ an toàn chuẩn (hỏi xác nhận khi cần).\n\n"
+                    f"Chế độ hiện tại: <code>{escape_html(cur_mode)}</code>",
+                    parse_mode="HTML",
+                    reply_markup=mode_keyboard(cur_mode),
+                )
+            except Exception:
+                pass
+        elif action == "workspace":
+            base = self.settings.approved_directory
+            cur_dir = context.user_data.get("current_directory", base)
+            is_custom = cur_dir.resolve() != base.resolve()
+            text = (
+                "📁 <b>Quản Lý Thư Mục Làm Việc (Workspace)</b>\n\n"
+                f"📍 <b>Thư mục đang hoạt động:</b> <code>{escape_html(str(cur_dir))}</code> {'(tùy chỉnh)' if is_custom else '(mặc định)'}\n"
+                f"⚙️ <b>Thư mục gốc:</b> <code>{escape_html(str(base))}</code>\n\n"
+                "<b>Cách dùng:</b>\n"
+                "• Bấm nút bên dưới để chuyển thư mục nhanh.\n"
+                "• Gõ <code>/workspace &lt;tên_thư_mục&gt;</code> để đổi thư mục.\n"
+                "• Gõ <code>/workspace reset</code> để về thư mục gốc."
+            )
+            try:
+                await query.edit_message_text(
+                    text,
+                    parse_mode="HTML",
+                    reply_markup=workspace_keyboard(cur_dir, base, 0),
+                )
+            except Exception:
+                pass
+        elif action.startswith("ws:"):
+            try:
+                page = int(action.split(":")[1])
+            except ValueError:
+                page = 0
+            base = self.settings.approved_directory
+            cur_dir = context.user_data.get("current_directory", base)
+            try:
+                await query.edit_message_reply_markup(
+                    reply_markup=workspace_keyboard(cur_dir, base, page)
+                )
+            except Exception:
+                pass
+
+    async def _handle_action_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle action: callbacks (compact, tokens, cancel, etc.)."""
+        query = update.callback_query
+        if not query or not query.data:
+            return
+        action = query.data.split(":", 1)[1] if ":" in query.data else ""
+
+        if action == "compact":
+            await query.answer()
+            await self.agentic_compact(update, context)
+        elif action == "tokens":
+            await query.answer()
+            await self.agentic_tokens(update, context)
+        elif action == "cancel":
+            await self.agentic_stop(update, context)
+            await query.answer()
+        elif action == "new_session":
+            await query.answer("Đang khởi tạo phiên mới...")
+            context.user_data["claude_session_id"] = None
+            context.user_data["session_started"] = True
+            context.user_data["force_new_session"] = True
+            context.user_data.pop("session_usage", None)
+            await query.message.reply_text(
+                "🆕 <b>Đã bắt đầu một phiên làm việc mới!</b>",
+                parse_mode="HTML",
+            )
+        elif action == "sessions":
+            await query.answer()
+            await self.agentic_sessions(update, context)
+        elif action == "help":
+            await query.answer()
+            await self.agentic_help(update, context)
+        else:
+            await query.answer()
+
+    async def _handle_noop_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle noop callbacks (informational button clicks)."""
+        if update.callback_query:
+            await update.callback_query.answer()
+

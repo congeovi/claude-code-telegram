@@ -43,6 +43,8 @@ class ClaudeIntegration:
         approval_callback: Optional[
             Callable[[str, Dict[str, Any]], Awaitable[bool]]
         ] = None,
+        model: Optional[str] = None,
+        permission_mode: Optional[str] = None,
     ) -> ClaudeResponse:
         """Run Claude Code command with full integration."""
         logger.info(
@@ -94,6 +96,8 @@ class ClaudeIntegration:
                     interrupt_event=interrupt_event,
                     images=images,
                     approval_callback=approval_callback,
+                    model=model,
+                    permission_mode=permission_mode,
                 )
             except Exception as resume_error:
                 # If resume failed (e.g., session expired/missing on Claude's side),
@@ -121,6 +125,8 @@ class ClaudeIntegration:
                         interrupt_event=interrupt_event,
                         images=images,
                         approval_callback=approval_callback,
+                        model=model,
+                        permission_mode=permission_mode,
                     )
                 else:
                     raise
@@ -169,6 +175,8 @@ class ClaudeIntegration:
         approval_callback: Optional[
             Callable[[str, Dict[str, Any]], Awaitable[bool]]
         ] = None,
+        model: Optional[str] = None,
+        permission_mode: Optional[str] = None,
     ) -> ClaudeResponse:
         """Execute command via SDK."""
         return await self.sdk_manager.execute_command(
@@ -180,6 +188,8 @@ class ClaudeIntegration:
             interrupt_event=interrupt_event,
             images=images,
             approval_callback=approval_callback,
+            model=model,
+            permission_mode=permission_mode,
         )
 
     async def _find_resumable_session(

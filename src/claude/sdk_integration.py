@@ -68,6 +68,7 @@ class ClaudeResponse:
     error_type: Optional[str] = None
     tools_used: List[Dict[str, Any]] = field(default_factory=list)
     interrupted: bool = False
+    usage: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -339,6 +340,8 @@ class ClaudeSDKManager:
         approval_callback: Optional[
             Callable[[str, Dict[str, Any]], Awaitable[bool]]
         ] = None,
+        model: Optional[str] = None,
+        permission_mode: Optional[str] = None,
     ) -> ClaudeResponse:
         """Execute Claude Code command via SDK."""
         start_time = asyncio.get_event_loop().time()
@@ -436,7 +439,8 @@ class ClaudeSDKManager:
             # Build Claude Agent options
             options = ClaudeAgentOptions(
                 max_turns=self.config.claude_max_turns,
-                model=self.config.claude_model or None,
+                model=model or self.config.claude_model or None,
+                permission_mode=permission_mode or None,
                 max_budget_usd=self.config.claude_max_cost_per_request,
                 cwd=str(working_directory),
                 allowed_tools=sdk_allowed_tools,
@@ -643,11 +647,13 @@ class ClaudeSDKManager:
             tools_used: List[Dict[str, Any]] = []
             claude_session_id = None
             result_content = None
+            usage: Optional[Dict[str, Any]] = None
             for message in messages:
                 if isinstance(message, ResultMessage):
                     cost = getattr(message, "total_cost_usd", 0.0) or 0.0
                     claude_session_id = getattr(message, "session_id", None)
                     result_content = getattr(message, "result", None)
+                    usage = getattr(message, "usage", None)
                     current_time = asyncio.get_event_loop().time()
                     for msg in messages:
                         if isinstance(msg, AssistantMessage):
@@ -762,6 +768,7 @@ class ClaudeSDKManager:
                 ),
                 tools_used=tools_used,
                 interrupted=interrupted,
+                usage=usage,
             )
 
         except asyncio.TimeoutError:
